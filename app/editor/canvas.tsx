@@ -1,6 +1,7 @@
 "use client";
 import { useId, useRef, useState } from "react";
 import { ElementArt, PageArt } from "./artwork";
+import { resizeElement, PRINT, type Handle } from "./geometry";
 import { H, W, type Element, type Page } from "./model";
 
 type Props = {
@@ -38,21 +39,23 @@ export default function Canvas({
     x: number;
     y: number;
     original: Element;
-    resize: boolean;
+    resize: Handle | null;
   } | null>(null);
   const [draft, setDraft] = useState<Element | null>(null);
   const currentDraft = useRef<Element | null>(null);
+  const bx = bleed ? (PRINT.bleedMm / PRINT.widthMm) * W : 0,
+    by = bleed ? (PRINT.bleedMm / PRINT.heightMm) * H : 0;
   function point(event: React.PointerEvent) {
     const rect = svg.current!.getBoundingClientRect();
     return {
-      x: ((event.clientX - rect.left) / rect.width) * W,
-      y: ((event.clientY - rect.top) / rect.height) * H,
+      x: ((event.clientX - rect.left) / rect.width) * (W + bx * 2) - bx,
+      y: ((event.clientY - rect.top) / rect.height) * (H + by * 2) - by,
     };
   }
   function start(
     event: React.PointerEvent<SVGGElement | SVGRectElement>,
     element: Element,
-    resize = false,
+    resize: Handle | null = null,
   ) {
     event.stopPropagation();
     onSelect(element.id);
@@ -68,20 +71,16 @@ export default function Canvas({
     const p = point(event),
       dx = p.x - g.x,
       dy = p.y - g.y;
-    const radians = (g.original.rotation * Math.PI) / 180;
     const next = {
       ...g.original,
       ...(g.resize
-        ? {
-            w: Math.max(
-              25,
-              g.original.w + dx * Math.cos(radians) + dy * Math.sin(radians),
-            ),
-            h: Math.max(
-              25,
-              g.original.h - dx * Math.sin(radians) + dy * Math.cos(radians),
-            ),
-          }
+        ? resizeElement(
+            g.original,
+            dx,
+            dy,
+            g.resize,
+            event.shiftKey || g.original.aspectLocked,
+          )
         : {
             x: Math.max(
               -g.original.w + 15,
@@ -118,8 +117,8 @@ export default function Canvas({
         if (page.locked) return;
         onSelect(null);
         const rect = svg.current!.getBoundingClientRect(),
-          x = ((event.clientX - rect.left) / rect.width) * W,
-          y = ((event.clientY - rect.top) / rect.height) * H;
+          x = ((event.clientX - rect.left) / rect.width) * (W + bx * 2) - bx,
+          y = ((event.clientY - rect.top) / rect.height) * (H + by * 2) - by;
         const target = [...page.elements]
           .reverse()
           .find(
@@ -141,7 +140,8 @@ export default function Canvas({
       <svg
         ref={svg}
         className="interactive-page"
-        viewBox={`0 0 ${W} ${H}`}
+        viewBox={`${-bx} ${-by} ${W + bx * 2} ${H + by * 2}`}
+        preserveAspectRatio="none"
         role="group"
         aria-label={`Page ${number}`}
         onPointerDown={() => onSelect(null)}
@@ -153,7 +153,13 @@ export default function Canvas({
           setDraft(null);
         }}
       >
-        <PageArt page={{ ...page, elements: [] }} index={number} />
+        <svg x={-bx} y={-by} width={W + bx * 2} height={H + by * 2}>
+          <PageArt
+            page={{ ...page, elements: [] }}
+            index={number}
+            bleedMm={bleed ? PRINT.bleedMm : 0}
+          />
+        </svg>
         {!page.locked &&
           page.elements
             .filter((e) => !e.hidden)
@@ -201,34 +207,43 @@ export default function Canvas({
                       />
                       {!e.locked && (
                         <>
-                          {[
-                            [-3, -3],
-                            [e.w + 3, -3],
-                            [-3, e.h + 3],
-                          ].map(([x, y], i) => (
+                          {(
+                            [
+                              [-1, -1],
+                              [0, -1],
+                              [1, -1],
+                              [-1, 0],
+                              [1, 0],
+                              [-1, 1],
+                              [0, 1],
+                              [1, 1],
+                            ] as Handle[]
+                          ).map(([hx, hy], i) => (
                             <rect
                               key={i}
-                              x={x - 3}
-                              y={y - 3}
-                              width="6"
-                              height="6"
+                              aria-label={`Resize ${["top left", "top", "top right", "left", "right", "bottom left", "bottom", "bottom right"][i]}`}
+                              role="button"
+                              x={((hx + 1) / 2) * e.w - 5}
+                              y={((hy + 1) / 2) * e.h - 5}
+                              width="10"
+                              height="10"
                               fill="white"
                               stroke="#bd7f69"
+                              onPointerDown={(event) =>
+                                start(event, e, [hx, hy])
+                              }
+                              style={{
+                                cursor:
+                                  hx === 0
+                                    ? "ns-resize"
+                                    : hy === 0
+                                      ? "ew-resize"
+                                      : hx === hy
+                                        ? "nwse-resize"
+                                        : "nesw-resize",
+                              }}
                             />
                           ))}
-                          <rect
-                            aria-label="Resize selected element"
-                            role="button"
-                            x={e.w - 3}
-                            y={e.h - 3}
-                            width="12"
-                            height="12"
-                            rx="1"
-                            fill="white"
-                            stroke="#bd7f69"
-                            onPointerDown={(event) => start(event, e, true)}
-                            style={{ cursor: "nwse-resize" }}
-                          />
                         </>
                       )}
                     </g>
@@ -249,10 +264,10 @@ export default function Canvas({
           )}
           {safe && (
             <rect
-              x="25"
-              y="25"
-              width={W - 50}
-              height={H - 50}
+              x={(PRINT.safeMm / PRINT.widthMm) * W}
+              y={(PRINT.safeMm / PRINT.heightMm) * H}
+              width={W - ((2 * PRINT.safeMm) / PRINT.widthMm) * W}
+              height={H - ((2 * PRINT.safeMm) / PRINT.heightMm) * H}
               stroke="#78a185"
               strokeWidth="1"
               strokeDasharray="5 4"
@@ -261,10 +276,10 @@ export default function Canvas({
           )}
           {bleed && (
             <rect
-              x="8"
-              y="8"
-              width={W - 16}
-              height={H - 16}
+              x={0}
+              y={0}
+              width={W}
+              height={H}
               stroke="#d89494"
               strokeWidth="1"
               strokeDasharray="5 4"

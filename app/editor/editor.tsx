@@ -25,34 +25,27 @@ import {
   type Page,
   type Project,
 } from "./model";
-import { download, loadProject, readPhoto, saveProject } from "./storage";
+import {
+  download,
+  loadProject,
+  readPhoto,
+  saveProject,
+  restorePhotoMetadata,
+} from "./storage";
 
-type History = { present: Project | null; past: Project[]; future: Project[] };
-type Action =
-  { type: "load" | "commit"; project: Project } | { type: "undo" | "redo" };
-function reducer(state: History, action: Action): History {
-  if (action.type === "load")
-    return { present: action.project, past: [], future: [] };
-  if (action.type === "commit")
-    return {
-      present: action.project,
-      past: state.present ? [...state.past, state.present].slice(-70) : [],
-      future: [],
-    };
-  if (action.type === "undo" && state.past.length)
-    return {
-      present: state.past.at(-1)!,
-      past: state.past.slice(0, -1),
-      future: [state.present!, ...state.future],
-    };
-  if (action.type === "redo" && state.future.length)
-    return {
-      present: state.future[0],
-      past: [...state.past, state.present!],
-      future: state.future.slice(1),
-    };
-  return state;
-}
+import { historyReducer as reducer } from "./history";
+import {
+  preserveLocked,
+  reorderLayer,
+  exportDimensions,
+  PRINT,
+  photoGeometry,
+} from "./geometry";
+import { loadFonts, textLayout, fontFor } from "./typography";
+import { masks, MaskShape } from "./masks";
+import { PrintSpread } from "./print-artwork";
+import { pngResolution } from "./png";
+
 const tabs = [
   "templates",
   "photos",
@@ -193,6 +186,15 @@ export default function Editor() {
     [toast, setToast] = useState(""),
     [search, setSearch] = useState(""),
     [comment, setComment] = useState("");
+  const [fontError, setFontError] = useState("");
+  const [rasterProof, setRasterProof] = useState<{
+    src: string;
+    width: number;
+    height: number;
+  } | null>(null);
+  const [exportDpi, setExportDpi] = useState(300),
+    [exportBleed, setExportBleed] = useState(true),
+    [cropMarks, setCropMarks] = useState(true);
   const [busy, setBusy] = useState(false),
     [preview, setPreview] = useState(false),
     [allPages, setAllPages] = useState(false);
@@ -200,6 +202,12 @@ export default function Editor() {
     [binding, setBinding] = useState("hardcover"),
     [cartAdded, setCartAdded] = useState(false);
   const [stageSize, setStageSize] = useState({ width: 1000, height: 700 });
+  useEffect(
+    () => () => {
+      if (rasterProof) URL.revokeObjectURL(rasterProof.src);
+    },
+    [rasterProof],
+  );
   const stage = useRef<HTMLDivElement>(null),
     upload = useRef<HTMLInputElement>(null),
     importInput = useRef<HTMLInputElement>(null),
@@ -220,24 +228,24 @@ export default function Editor() {
 
   useEffect(() => {
     let live = true;
-    loadProject()
-      .then((p) => {
+    Promise.all([loadFonts(), loadProject().catch(() => undefined)])
+      .then(async ([, p]) => {
+        const restored = p
+          ? await restorePhotoMetadata(parseProject(JSON.stringify(p)))
+          : createProject();
         if (live) {
           dispatch({
             type: "load",
-            project: p ? parseProject(JSON.stringify(p)) : createProject(),
+            project: restored,
           });
           setSaved("saved");
         }
       })
-      .catch(() => {
-        if (live) {
-          dispatch({ type: "load", project: createProject() });
-          setSaved("error");
-          notify(
-            "Local storage is unavailable. Download your project to keep a copy.",
+      .catch((error) => {
+        if (live)
+          setFontError(
+            error instanceof Error ? error.message : "Could not open editor.",
           );
-        }
       });
     return () => {
       live = false;
@@ -290,8 +298,18 @@ export default function Editor() {
   }, [modal]);
 
   const updatePage = useCallback(
-    (patch: Partial<Page>, target = side) => {
+    (patch: Partial<Page>, target = side, allowedId?: string) => {
       if (!project || !spread || spread.pages[target].locked) return;
+      const guardedPatch = patch.elements
+        ? {
+            ...patch,
+            elements: preserveLocked(
+              spread.pages[target].elements,
+              patch.elements,
+              allowedId,
+            ),
+          }
+        : patch;
       commit({
         ...project,
         spreads: project.spreads.map((s, i) =>
@@ -299,7 +317,7 @@ export default function Editor() {
             ? {
                 ...s,
                 pages: s.pages.map((p, j) =>
-                  j === target ? { ...p, ...patch } : p,
+                  j === target ? { ...p, ...guardedPatch } : p,
                 ) as [Page, Page],
               }
             : s,
@@ -311,6 +329,11 @@ export default function Editor() {
   const updateElement = useCallback(
     (id: string, patch: Partial<Element>, target = side) => {
       if (!spread) return;
+      const current = spread.pages[target].elements.find((e) => e.id === id);
+      const lockControl = Object.keys(patch).every(
+        (k) => k === "locked" || k === "hidden",
+      );
+      if (current?.locked && !lockControl) return;
       updatePage(
         {
           elements: spread.pages[target].elements.map((e) =>
@@ -318,6 +341,7 @@ export default function Editor() {
           ),
         },
         target,
+        lockControl ? id : undefined,
       );
     },
     [spread, side, updatePage],
@@ -390,6 +414,8 @@ export default function Editor() {
   };
   function addPhoto(src: string, target = side, id?: string) {
     if (!spread) return;
+    const source = project?.photos.find((p) => p.src === src);
+    const dimensions = { sourceW: source?.width, sourceH: source?.height };
     const p = spread.pages[target];
     if (p.locked) {
       notify("Choose an editable page first.");
@@ -401,13 +427,18 @@ export default function Editor() {
           (e) => e.id === selected && e.kind === "photo" && !e.locked,
         );
     if (frame && !frame.locked) {
-      updateElement(frame.id, { src, crop: 1, focalX: 50, focalY: 50 }, target);
+      updateElement(
+        frame.id,
+        { src, ...dimensions, crop: 1, focalX: 50, focalY: 50 },
+        target,
+      );
       setSide(target);
       setSelected(frame.id);
     } else
       addElement(
         baseElement("photo", {
           src,
+          ...dimensions,
           x: 75,
           y: 100,
           w: 270,
@@ -425,13 +456,11 @@ export default function Editor() {
     setBusy(true);
     try {
       const results = await Promise.allSettled(
-        files
-          .slice(0, 30)
-          .map(async (f) => ({
-            id: uid(),
-            name: f.name,
-            src: await readPhoto(f),
-          })),
+        files.slice(0, 30).map(async (f) => ({
+          id: uid(),
+          name: f.name,
+          ...(await readPhoto(f)),
+        })),
       );
       const added = results.flatMap((r) =>
         r.status === "fulfilled" ? [r.value] : [],
@@ -444,6 +473,8 @@ export default function Editor() {
             frame = p.elements.find((e) => e.id === target.id && !e.locked),
             newElement = baseElement("photo", {
               src: added[0].src,
+              sourceW: added[0].width,
+              sourceH: added[0].height,
               x: 75,
               y: 100,
               w: 270,
@@ -461,7 +492,13 @@ export default function Editor() {
                           elements: frame
                             ? pg.elements.map((e) =>
                                 e.id === frame.id
-                                  ? { ...e, src: added[0].src, crop: 1 }
+                                  ? {
+                                      ...e,
+                                      src: added[0].src,
+                                      sourceW: added[0].width,
+                                      sourceH: added[0].height,
+                                      crop: 1,
+                                    }
                                   : e,
                               )
                             : [...pg.elements, newElement],
@@ -571,12 +608,8 @@ export default function Editor() {
   }
   function moveLayer(direction: number) {
     if (!page || !selected) return;
-    const elements = [...page.elements],
-      i = elements.findIndex((e) => e.id === selected),
-      j = i + direction;
-    if (i < 0 || j < 0 || j >= elements.length) return;
-    [elements[i], elements[j]] = [elements[j], elements[i]];
-    updatePage({ elements });
+    const elements = reorderLayer(page.elements, selected, direction);
+    if (elements !== page.elements) updatePage({ elements });
   }
   function exportProject() {
     if (!project) return;
@@ -594,7 +627,7 @@ export default function Editor() {
     try {
       if (file.size > 100 * 1024 * 1024)
         throw new Error("Projects must be smaller than 100 MB.");
-      const next = parseProject(await file.text());
+      const next = await restorePhotoMetadata(parseProject(await file.text()));
       commit(next);
       setIndex(0);
       setSide(1);
@@ -611,24 +644,16 @@ export default function Editor() {
     setBusy(true);
     try {
       const { renderToStaticMarkup } = await import("react-dom/server");
+      await loadFonts();
+      const dimensions = exportDimensions(exportDpi, exportBleed, cropMarks);
       const markup = renderToStaticMarkup(
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width={W * 2}
-          height={H}
-          viewBox={`0 0 ${W * 2} ${H}`}
-        >
-          <svg width={W} height={H}>
-            <PageArt page={spread.pages[0]} index={currentIndex * 2} preview />
-          </svg>
-          <svg x={W} width={W} height={H}>
-            <PageArt
-              page={spread.pages[1]}
-              index={currentIndex * 2 + 1}
-              preview
-            />
-          </svg>
-        </svg>,
+        <PrintSpread
+          spread={spread}
+          index={currentIndex}
+          bleed={exportBleed}
+          marks={cropMarks}
+          dpi={exportDpi}
+        />,
       );
       const blob = new Blob([markup], { type: "image/svg+xml;charset=utf-8" });
       const name = `${project.name}-${label(currentIndex)}`;
@@ -644,8 +669,8 @@ export default function Editor() {
             img.src = url;
           });
           const canvas = document.createElement("canvas");
-          canvas.width = W * 4;
-          canvas.height = H * 2;
+          canvas.width = dimensions.width;
+          canvas.height = dimensions.height;
           const ctx = canvas.getContext("2d");
           if (!ctx) throw new Error("Canvas export unavailable.");
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
@@ -656,7 +681,21 @@ export default function Editor() {
               "image/png",
             ),
           );
-          download(png, `${name}.png`);
+          const tagged = new Blob(
+            [
+              pngResolution(
+                new Uint8Array(await png.arrayBuffer()),
+                exportDpi,
+              ).slice().buffer as ArrayBuffer,
+            ],
+            { type: "image/png" },
+          );
+          download(tagged, `${name}.png`);
+          setRasterProof({
+            src: URL.createObjectURL(tagged),
+            width: canvas.width,
+            height: canvas.height,
+          });
         } finally {
           URL.revokeObjectURL(url);
         }
@@ -765,10 +804,58 @@ export default function Editor() {
         <div className="wordmark">
           pixory<span>✳</span>
         </div>
-        <span>Opening your little book of memories…</span>
+        <span>{fontError || "Opening your little book of memories…"}</span>
       </main>
     );
-  const issues = warnings(project),
+  const issues = [
+      ...warnings(project),
+      ...project.spreads.flatMap((spread, i) =>
+        spread.pages.flatMap((p) =>
+          p.elements
+            .filter((e) => !e.hidden)
+            .flatMap((e) => {
+              if (e.kind === "text") {
+                const messages = [];
+                if (textLayout(e).height > e.h + 1)
+                  messages.push({
+                    spread: i,
+                    id: e.id,
+                    text: `Text overflows its box on pages ${label(i)}`,
+                  });
+                const font = fontFor(e);
+                if (
+                  font &&
+                  Array.from(e.text || "").some(
+                    (c) => !/[\s]/.test(c) && font.charToGlyphIndex(c) === 0,
+                  )
+                )
+                  messages.push({
+                    spread: i,
+                    id: e.id,
+                    text: `Font lacks a character on pages ${label(i)}. Choose another font or change the text.`,
+                  });
+                return messages;
+              }
+              if (e.kind === "photo" && e.src && e.sourceW && e.sourceH) {
+                const g = photoGeometry(e),
+                  dpi = Math.min(
+                    e.sourceW / (((g.width / W) * PRINT.widthMm) / 25.4),
+                    e.sourceH / (((g.height / H) * PRINT.heightMm) / 25.4),
+                  );
+                if (dpi < 200)
+                  return [
+                    {
+                      spread: i,
+                      id: e.id,
+                      text: `Photo resolution is ${Math.round(dpi)} DPI on pages ${label(i)} (below 200 DPI)`,
+                    },
+                  ];
+              }
+              return [];
+            }),
+        ),
+      ),
+    ],
     scale =
       Math.max(
         0.15,
@@ -1177,10 +1264,18 @@ export default function Editor() {
                       ? "Give your selected photo a new look."
                       : "Pick a style to add a new photo frame."}
                   </p>
+                  {panel === "masks" && selectedElement?.kind === "photo" && (
+                    <button
+                      className="button wide"
+                      onClick={() => applyPhotoStyle({ mask: "rectangle" })}
+                    >
+                      remove mask
+                    </button>
+                  )}
                   <div className="style-library">
                     {(panel === "frames"
                       ? ["polaroid", "thin", "dark", "none"]
-                      : ["rectangle", "rounded", "circle", "arch", "heart"]
+                      : masks
                     ).map((style) => (
                       <button
                         key={style}
@@ -1192,25 +1287,20 @@ export default function Editor() {
                           )
                         }
                       >
-                        <div
-                          className={`frame-example ${panel === "frames" ? style : "none"}`}
-                          style={{
-                            borderRadius:
-                              style === "circle"
-                                ? "50%"
-                                : style === "rounded"
-                                  ? 12
-                                  : style === "arch"
-                                    ? "50% 50% 0 0"
-                                    : undefined,
-                            clipPath:
-                              style === "heart"
-                                ? "polygon(50% 16%, 70% 0, 100% 15%, 100% 45%, 50% 100%, 0 45%, 0 15%, 30% 0)"
-                                : undefined,
-                          }}
-                        >
-                          <Icon name="image" size={25} />
-                        </div>
+                        {panel === "masks" ? (
+                          <svg
+                            viewBox="0 0 100 100"
+                            width="68"
+                            height="85"
+                            fill="#c7cabe"
+                          >
+                            <MaskShape shape={style} w={100} h={100} />
+                          </svg>
+                        ) : (
+                          <div className={`frame-example ${style}`}>
+                            <Icon name="image" size={25} />
+                          </div>
+                        )}
                         <span>{style}</span>
                       </button>
                     ))}
@@ -1379,13 +1469,17 @@ export default function Editor() {
                                 : {
                                     ...p,
                                     background: theme.bg,
-                                    elements: p.elements.map((e) => ({
-                                      ...e,
-                                      color: theme.color,
-                                      ...(e.kind === "text"
-                                        ? { font: theme.font }
-                                        : {}),
-                                    })),
+                                    elements: p.elements.map((e) =>
+                                      e.locked
+                                        ? e
+                                        : {
+                                            ...e,
+                                            color: theme.color,
+                                            ...(e.kind === "text"
+                                              ? { font: theme.font }
+                                              : {}),
+                                          },
+                                    ),
                                   },
                             ) as [Page, Page],
                           })),
@@ -1921,6 +2015,9 @@ export default function Editor() {
                         ))}
                       </select>
                     </label>
+                    <p className="small muted">
+                      Bundled fonts · text exports as vector outlines.
+                    </p>
                     <div className="text-controls">
                       <NumberField
                         label="Font size"
@@ -1953,6 +2050,17 @@ export default function Editor() {
                       >
                         <i>I</i>
                       </button>
+                      <button
+                        aria-label="Underline"
+                        className={selectedElement.underline ? "active" : ""}
+                        onClick={() =>
+                          updateElement(selectedElement.id, {
+                            underline: !selectedElement.underline,
+                          })
+                        }
+                      >
+                        <u>U</u>
+                      </button>
                     </div>
                     <div className="segmented">
                       {["left", "center", "right"].map((align) => (
@@ -1971,6 +2079,49 @@ export default function Editor() {
                         </button>
                       ))}
                     </div>
+                  </>
+                )}
+                {selectedElement.kind === "text" && (
+                  <>
+                    <label className="range-label">
+                      <span>Letter spacing</span>
+                      <input
+                        aria-label="Letter spacing"
+                        type="range"
+                        min="-2"
+                        max="10"
+                        step="0.25"
+                        value={selectedElement.letterSpacing || 0}
+                        onChange={(e) =>
+                          updateElement(selectedElement.id, {
+                            letterSpacing: Number(e.target.value),
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="range-label">
+                      <span>Line height</span>
+                      <input
+                        aria-label="Line height"
+                        type="range"
+                        min="0.8"
+                        max="2.5"
+                        step="0.05"
+                        value={selectedElement.lineHeight || 1.35}
+                        onChange={(e) =>
+                          updateElement(selectedElement.id, {
+                            lineHeight: Number(e.target.value),
+                          })
+                        }
+                      />
+                    </label>
+                    {textLayout(selectedElement).height >
+                      selectedElement.h + 1 && (
+                      <p className="small save-error">
+                        Text exceeds the box height. Increase its height or
+                        reduce the font size.
+                      </p>
+                    )}
                   </>
                 )}
                 {selectedElement.kind === "photo" && (
@@ -1992,6 +2143,51 @@ export default function Editor() {
                     >
                       <Icon name="crop" size={16} /> adjust crop
                     </button>
+                    <div className="segmented">
+                      {["cover", "contain"].map((fit) => (
+                        <button
+                          key={fit}
+                          className={
+                            (selectedElement.fit || "cover") === fit
+                              ? "active"
+                              : ""
+                          }
+                          onClick={() =>
+                            updateElement(selectedElement.id, {
+                              fit: fit as "cover" | "contain",
+                              crop: 1,
+                              focalX: 50,
+                              focalY: 50,
+                            })
+                          }
+                        >
+                          {fit === "cover" ? "fill frame" : "fit photo"}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="page-actions">
+                      <button
+                        className="button"
+                        onClick={() =>
+                          updateElement(selectedElement.id, {
+                            flipX: !selectedElement.flipX,
+                          })
+                        }
+                      >
+                        flip horizontal
+                      </button>
+                      <button
+                        className="button"
+                        onClick={() =>
+                          updateElement(selectedElement.id, {
+                            flipY: !selectedElement.flipY,
+                          })
+                        }
+                      >
+                        flip vertical
+                      </button>
+                    </div>
+
                     <label className="field-label">
                       FRAME
                       <select
@@ -2026,6 +2222,21 @@ export default function Editor() {
                   </label>
                 )}
                 <div className="section-label">POSITION & SIZE</div>
+                <label className="check-field">
+                  <input
+                    type="checkbox"
+                    checked={selectedElement.aspectLocked || false}
+                    onChange={(e) =>
+                      updateElement(selectedElement.id, {
+                        aspectLocked: e.target.checked,
+                      })
+                    }
+                  />{" "}
+                  Lock aspect ratio
+                </label>
+                <p className="small muted">
+                  Hold Shift while resizing a corner to keep proportions.
+                </p>
                 <div className="position-grid">
                   <NumberField
                     label="X"
@@ -2043,13 +2254,27 @@ export default function Editor() {
                     label="Width"
                     min={25}
                     value={selectedElement.w}
-                    onChange={(w) => updateElement(selectedElement.id, { w })}
+                    onChange={(w) =>
+                      updateElement(selectedElement.id, {
+                        w,
+                        ...(selectedElement.aspectLocked
+                          ? { h: (selectedElement.h * w) / selectedElement.w }
+                          : {}),
+                      })
+                    }
                   />
                   <NumberField
                     label="Height"
                     min={25}
                     value={selectedElement.h}
-                    onChange={(h) => updateElement(selectedElement.id, { h })}
+                    onChange={(h) =>
+                      updateElement(selectedElement.id, {
+                        h,
+                        ...(selectedElement.aspectLocked
+                          ? { w: (selectedElement.w * h) / selectedElement.h }
+                          : {}),
+                      })
+                    }
                   />
                 </div>
                 <NumberField
@@ -2079,6 +2304,43 @@ export default function Editor() {
                     }
                   />
                 </label>
+                <div className="segmented">
+                  <button onClick={() => moveLayer(-page.elements.length)}>
+                    send to back
+                  </button>
+                  <button onClick={() => moveLayer(page.elements.length)}>
+                    bring to front
+                  </button>
+                </div>
+                <div className="section-label">ALIGN TO PAGE</div>
+                <div className="align-controls">
+                  {["left", "center", "right", "top", "middle", "bottom"].map(
+                    (alignment) => (
+                      <button
+                        className="button"
+                        key={alignment}
+                        onClick={() =>
+                          updateElement(
+                            selectedElement.id,
+                            alignment === "left"
+                              ? { x: 0 }
+                              : alignment === "center"
+                                ? { x: (W - selectedElement.w) / 2 }
+                                : alignment === "right"
+                                  ? { x: W - selectedElement.w }
+                                  : alignment === "top"
+                                    ? { y: 0 }
+                                    : alignment === "middle"
+                                      ? { y: (H - selectedElement.h) / 2 }
+                                      : { y: H - selectedElement.h },
+                          )
+                        }
+                      >
+                        {alignment}
+                      </button>
+                    ),
+                  )}
+                </div>
                 <div className="page-actions">
                   <Button
                     icon="arrowUp"
@@ -2343,7 +2605,7 @@ export default function Editor() {
                     onClick={() => setModal("warnings")}
                   >
                     <Icon name="warning" size={16} />
-                    {issues.length} photo frames still need a memory
+                    {issues.length} items to review before printing
                   </button>
                 )}
                 <div className="local-notice">
@@ -2415,11 +2677,54 @@ export default function Editor() {
                   >
                     <Icon name="warning" size={18} />
                     <span>
-                      {issues.length} empty photo frames — review your book
+                      {issues.length} preflight warnings — review your book
                     </span>
                     <Icon name="right" size={16} />
                   </button>
                 )}
+                <div className="export-settings">
+                  <label className="field-label">
+                    RASTER RESOLUTION
+                    <select
+                      aria-label="Export resolution"
+                      value={exportDpi}
+                      onChange={(e) => setExportDpi(Number(e.target.value))}
+                    >
+                      <option value={150}>150 DPI · smaller file</option>
+                      <option value={300}>300 DPI · print quality</option>
+                    </select>
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={exportBleed}
+                      onChange={(e) => setExportBleed(e.target.checked)}
+                    />{" "}
+                    Include 3 mm bleed
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={cropMarks}
+                      onChange={(e) => setCropMarks(e.target.checked)}
+                    />{" "}
+                    Include crop marks
+                  </label>
+                  <p className="small">
+                    A4 trim: 210 × 297 mm per page · 5 mm safe margin.{" "}
+                    {exportDimensions(exportDpi, exportBleed, cropMarks).width}{" "}
+                    ×{" "}
+                    {exportDimensions(exportDpi, exportBleed, cropMarks).height}{" "}
+                    pixels.
+                  </p>
+                  <PrintSpread
+                    spread={spread}
+                    index={currentIndex}
+                    bleed={exportBleed}
+                    marks={cropMarks}
+                    guides
+                  />
+                </div>
                 <div className="export-options">
                   <button
                     disabled={busy}
@@ -2428,7 +2733,7 @@ export default function Editor() {
                     <span className="format-icon">PNG</span>
                     <span>
                       <strong>High-resolution image</strong>
-                      <small>Current spread · 1680 × 1160 pixels</small>
+                      <small>Current spread · {exportDpi} DPI</small>
                     </span>
                     <Icon name="download" />
                   </button>
@@ -2439,7 +2744,9 @@ export default function Editor() {
                     <span className="format-icon">SVG</span>
                     <span>
                       <strong>Scalable artwork</strong>
-                      <small>Current spread · embedded photos</small>
+                      <small>
+                        Current spread · outlined text & embedded photos
+                      </small>
                     </span>
                     <Icon name="download" />
                   </button>
@@ -2452,7 +2759,9 @@ export default function Editor() {
                     <span className="format-icon">PDF</span>
                     <span>
                       <strong>Print your whole book</strong>
-                      <small>All spreads · select “Save as PDF”</small>
+                      <small>
+                        All spreads · current bleed and crop-mark settings
+                      </small>
                     </span>
                     <Icon name="export" />
                   </button>
@@ -2465,6 +2774,15 @@ export default function Editor() {
                     <Icon name="download" />
                   </button>
                 </div>
+                {rasterProof && (
+                  <figure className="raster-proof">
+                    <img src={rasterProof.src} alt="Exported raster proof" />
+                    <figcaption>
+                      Last generated PNG · {rasterProof.width} ×{" "}
+                      {rasterProof.height} pixels
+                    </figcaption>
+                  </figure>
+                )}
                 <p className="small muted">
                   Exports are free. Physical printing and checkout are not
                   connected.
@@ -2481,13 +2799,13 @@ export default function Editor() {
                 </h2>
                 <p>
                   {issues.length
-                    ? "These photo frames are still waiting for a memory. Click one to jump to it."
+                    ? "Review empty photos, print resolution, and text overflow. Click an item to jump to it."
                     : "Every visible photo frame has a photo. Preview your book before exporting."}
                 </p>
                 <div className="warning-list">
                   {issues.map((issue) => (
                     <button
-                      key={issue.id}
+                      key={`${issue.id}-${issue.text}`}
                       onClick={() => {
                         navigate(issue.spread);
                         const s = project.spreads[issue.spread];
@@ -2687,12 +3005,16 @@ export default function Editor() {
           />
         </div>
       )}
+      <style>{`@media print { @page { size: ${exportDimensions(exportDpi, exportBleed, cropMarks).widthMm}mm ${exportDimensions(exportDpi, exportBleed, cropMarks).heightMm}mm; margin: 0; } .print-spread { width: ${exportDimensions(exportDpi, exportBleed, cropMarks).widthMm}mm !important; height: ${exportDimensions(exportDpi, exportBleed, cropMarks).heightMm}mm !important; } }`}</style>
       <div className="print-book">
         {project.spreads.map((s, i) => (
           <div className="print-spread" key={s.id}>
-            {s.pages.map((p, j) => (
-              <PageArt key={p.id} page={p} index={i * 2 + j} preview />
-            ))}
+            <PrintSpread
+              spread={s}
+              index={i}
+              bleed={exportBleed}
+              marks={cropMarks}
+            />
           </div>
         ))}
       </div>

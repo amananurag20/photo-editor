@@ -14,6 +14,15 @@ export type Element = {
   size?: number;
   bold?: boolean;
   italic?: boolean;
+  underline?: boolean;
+  letterSpacing?: number;
+  lineHeight?: number;
+  aspectLocked?: boolean;
+  sourceW?: number;
+  sourceH?: number;
+  fit?: "cover" | "contain";
+  flipX?: boolean;
+  flipY?: boolean;
   align?: "left" | "center" | "right";
   src?: string;
   frame?: string;
@@ -33,7 +42,13 @@ export type Page = {
   elements: Element[];
 };
 export type Spread = { id: string; pages: [Page, Page] };
-export type Photo = { id: string; src: string; name: string };
+export type Photo = {
+  id: string;
+  src: string;
+  name: string;
+  width?: number;
+  height?: number;
+};
 export type Comment = {
   id: string;
   spreadId: string;
@@ -49,16 +64,16 @@ export type Project = {
   comments: Comment[];
 };
 export const W = 420,
-  H = 580;
+  H = 594;
 export const PAPER = "#f5f2ec",
   INK = "#815c5c";
 export const fonts = ["Cursive", "Serif", "Sans", "Monospace"];
 export const fontFamily = (font?: string) =>
   ({
-    Cursive: "'Segoe Print', 'Bradley Hand', 'Comic Sans MS', cursive",
-    Serif: "Georgia, serif",
-    Sans: "Arial, sans-serif",
-    Monospace: "'Courier New', monospace",
+    Cursive: "PixoryCursive, cursive",
+    Serif: "PixorySerif, serif",
+    Sans: "PixorySans, sans-serif",
+    Monospace: "PixoryMonospace, monospace",
   })[font || "Serif"] || "Georgia, serif";
 export const uid = () => crypto.randomUUID();
 export const label = (index: number) =>
@@ -360,9 +375,41 @@ export function parseProject(raw: string): Project {
           (typeof e.text !== "string" || e.text.length > 20000)
         )
           throw new Error("Invalid text.");
-        for (const k of ["size", "crop", "focalX", "focalY"])
+        for (const k of [
+          "size",
+          "crop",
+          "focalX",
+          "focalY",
+          "sourceW",
+          "sourceH",
+          "letterSpacing",
+          "lineHeight",
+        ])
           if (e[k] !== undefined && !finite(e[k]))
             throw new Error("Invalid element measurement.");
+        if (
+          (e.sourceW !== undefined && e.sourceW <= 0) ||
+          (e.sourceH !== undefined && e.sourceH <= 0) ||
+          (e.size !== undefined && e.size <= 0) ||
+          (e.crop !== undefined && (e.crop < 1 || e.crop > 10)) ||
+          (e.lineHeight !== undefined &&
+            (e.lineHeight < 0.5 || e.lineHeight > 5))
+        )
+          throw new Error("Invalid element dimensions.");
+        if (e.font !== undefined && !fonts.includes(e.font))
+          throw new Error("Unknown font family.");
+        for (const k of [
+          "bold",
+          "italic",
+          "underline",
+          "aspectLocked",
+          "flipX",
+          "flipY",
+          "hidden",
+          "locked",
+        ])
+          if (e[k] !== undefined && typeof e[k] !== "boolean")
+            throw new Error("Invalid element flag.");
         for (const k of ["font", "align", "frame", "mask", "sticker"])
           if (e[k] !== undefined && typeof e[k] !== "string")
             throw new Error("Invalid element style.");

@@ -1,5 +1,8 @@
 import { useId } from "react";
 import { fontFamily, H, W, type Element, type Page } from "./model";
+import { textPaths, fontFor } from "./typography";
+import { photoGeometry } from "./geometry";
+import { MaskShape } from "./masks";
 
 export function Sticker({
   name,
@@ -123,6 +126,27 @@ export function ElementArt({
 }) {
   const clip = `${prefix}-${e.id}-clip`;
   if (e.kind === "text") {
+    if (fontFor(e))
+      return (
+        <g
+          fill={e.color}
+          transform={e.italic && e.font === "Cursive" ? "skewX(-8)" : undefined}
+        >
+          {textPaths(e).map((line, i) => (
+            <g key={i}>
+              <path d={line.d} />
+              {e.underline && (
+                <rect
+                  x={line.x}
+                  y={line.y + (e.size || 28) * 0.12}
+                  width={Math.max(0, line.width)}
+                  height={(e.size || 28) * 0.055}
+                />
+              )}
+            </g>
+          ))}
+        </g>
+      );
     const size = e.size || 28,
       lines = wrapText(e.text || "", e.w, size),
       x = e.align === "left" ? 0 : e.align === "right" ? e.w : e.w / 2;
@@ -175,28 +199,12 @@ export function ElementArt({
         fill={e.color}
       />
     );
-  const border = e.frame === "none" ? 0 : e.frame === "thin" ? 3 : 10;
-  const iw = e.w - border * 2,
-    ih = e.h - border * 2 - (e.frame === "polaroid" ? 24 : 0);
-  const zoom = e.crop || 1;
+  const { border, iw, ih, width, height, x, y } = photoGeometry(e);
   return (
     <g>
       <defs>
         <clipPath id={clip}>
-          {e.mask === "circle" ? (
-            <ellipse cx={e.w / 2} cy={e.h / 2} rx={e.w / 2} ry={e.h / 2} />
-          ) : e.mask === "heart" ? (
-            <path
-              transform={`scale(${e.w / 100} ${e.h / 100})`}
-              d="M50 97C25 77-8 42 5 17 18-7 44-1 50 20 65-9 97-3 99 24 102 48 72 82 50 97Z"
-            />
-          ) : e.mask === "arch" ? (
-            <path
-              d={`M0 ${e.w / 2}a${e.w / 2} ${e.w / 2} 0 0 1 ${e.w} 0V${e.h}H0Z`}
-            />
-          ) : (
-            <rect width={e.w} height={e.h} rx={e.mask === "rounded" ? 24 : 0} />
-          )}
+          <MaskShape shape={e.mask} w={e.w} h={e.h} />
         </clipPath>
       </defs>
       <g clipPath={`url(#${clip})`}>
@@ -217,10 +225,11 @@ export function ElementArt({
           {e.src ? (
             <image
               href={e.src}
-              x={(-iw * (zoom - 1) * (e.focalX ?? 50)) / 100}
-              y={(-ih * (zoom - 1) * (e.focalY ?? 50)) / 100}
-              width={iw * zoom}
-              height={ih * zoom}
+              x={x}
+              y={y}
+              width={width}
+              height={height}
+              transform={`translate(${e.flipX ? iw : 0} ${e.flipY ? ih : 0}) scale(${e.flipX ? -1 : 1} ${e.flipY ? -1 : 1})`}
               preserveAspectRatio="xMidYMid slice"
             />
           ) : (
@@ -255,19 +264,24 @@ export function PageArt({
   page,
   index = 0,
   preview = false,
+  bleedMm = 0,
   children,
 }: {
   page: Page;
   index?: number;
   preview?: boolean;
+  bleedMm?: number;
   children?: React.ReactNode;
 }) {
   const raw = useId(),
     id = raw.replace(/:/g, "");
+  const bx = (bleedMm / 210) * W,
+    by = (bleedMm / 297) * H;
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"
-      viewBox={`0 0 ${W} ${H}`}
+      viewBox={`${-bx} ${-by} ${W + bx * 2} ${H + by * 2}`}
+      preserveAspectRatio="none"
       className="page-art"
       aria-hidden="true"
     >
@@ -301,10 +315,18 @@ export function PageArt({
           <path d="M0 26H26 M26 0V26" stroke="#9a8d82" opacity=".18" />
         </pattern>
       </defs>
-      <rect width={W} height={H} fill={page.background} />
       <rect
-        width={W}
-        height={H}
+        x={-bx}
+        y={-by}
+        width={W + bx * 2}
+        height={H + by * 2}
+        fill={page.background}
+      />
+      <rect
+        x={-bx}
+        y={-by}
+        width={W + bx * 2}
+        height={H + by * 2}
         fill={`url(#${id}-${page.pattern || "linen"})`}
       />
       {page.locked && !preview && (
@@ -332,7 +354,7 @@ export function PageArt({
       {index > 1 && !page.locked && (
         <text
           x={index % 2 ? 386 : 34}
-          y="558"
+          y={H - 22}
           fill="#aaa198"
           fontSize="13"
           fontFamily="Georgia, serif"

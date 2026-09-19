@@ -1,5 +1,51 @@
 import type { Project } from "./model";
 
+export async function restorePhotoMetadata(project: Project): Promise<Project> {
+  const dimensions = new Map<
+    string,
+    Promise<{ width: number; height: number }>
+  >();
+  const read = (src: string) => {
+    if (!dimensions.has(src))
+      dimensions.set(
+        src,
+        new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () =>
+            resolve({ width: image.naturalWidth, height: image.naturalHeight });
+          image.onerror = () =>
+            reject(new Error("A saved photo could not be decoded."));
+          image.src = src;
+        }),
+      );
+    return dimensions.get(src)!;
+  };
+  const photos = await Promise.all(
+    project.photos.map(async (p) =>
+      p.width && p.height ? p : { ...p, ...(await read(p.src)) },
+    ),
+  );
+  const spreads = await Promise.all(
+    project.spreads.map(async (s) => ({
+      ...s,
+      pages: (await Promise.all(
+        s.pages.map(async (p) => ({
+          ...p,
+          elements: await Promise.all(
+            p.elements.map(async (e) => {
+              if (e.kind !== "photo" || !e.src || (e.sourceW && e.sourceH))
+                return e;
+              const { width, height } = await read(e.src);
+              return { ...e, sourceW: width, sourceH: height };
+            }),
+          ),
+        })),
+      )) as typeof s.pages,
+    })),
+  );
+  return { ...project, photos, spreads };
+}
+
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open("pixory-studio", 1);
@@ -42,22 +88,21 @@ export function download(blob: Blob, name: string) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
-export async function readPhoto(file: File): Promise<string> {
+export async function readPhoto(
+  file: File,
+): Promise<{ src: string; width: number; height: number }> {
   if (!["image/png", "image/jpeg", "image/webp"].includes(file.type))
     throw new Error("Please choose JPG, PNG, or WebP photos.");
   if (file.size > 25 * 1024 * 1024)
     throw new Error(`${file.name} is larger than 25 MB.`);
-  const bitmap = await createImageBitmap(file),
-    scale = Math.min(1, 2400 / Math.max(bitmap.width, bitmap.height));
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(bitmap.width * scale);
-  canvas.height = Math.round(bitmap.height * scale);
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Your browser could not read this photo.");
-  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  const bitmap = await createImageBitmap(file);
+  const { width, height } = bitmap;
   bitmap.close();
-  return canvas.toDataURL(
-    file.type === "image/png" ? "image/png" : "image/jpeg",
-    0.9,
-  );
+  const src = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("Could not read photo."));
+    reader.readAsDataURL(file);
+  });
+  return { src, width, height };
 }
